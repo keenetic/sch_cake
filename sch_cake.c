@@ -1619,12 +1619,20 @@ static unsigned int cake_drop(struct Qdisc *sch, struct sk_buff **to_free)
 	return idx + (tin << 16);
 }
 
+static inline __be16 cake_skb_proto(const struct sk_buff *skb)
+{
+	if (skb->protocol == htons(ETH_P_8021Q))
+		return vlan_eth_hdr(skb)->h_vlan_encapsulated_proto;
+
+	return skb->protocol;
+}
+
 static u8 cake_handle_diffserv(struct sk_buff *skb, u16 wash)
 {
 	int wlen = skb_network_offset(skb);
 	u8 dscp;
 
-	switch (tc_skb_protocol(skb)) {
+	switch (cake_skb_proto(skb)) {
 	case htons(ETH_P_IP):
 		wlen += sizeof(struct iphdr);
 		if (!pskb_may_pull(skb, wlen) ||
