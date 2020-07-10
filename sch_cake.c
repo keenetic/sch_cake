@@ -63,6 +63,7 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/reciprocal_div.h>
+#include <linux/ppp_defs.h>
 #include <net/netlink.h>
 #include <linux/version.h>
 #include "pkt_sched.h"
@@ -283,6 +284,8 @@ enum {
 struct cobalt_skb_cb {
 	ktime_t enqueue_time;
 	u32     adjusted_len;
+	__be16  inner_proto;
+	u16     iphdr_offset;
 };
 
 static u64 us_to_ns(u64 us)
@@ -526,26 +529,48 @@ static __be16 cake_skb_proto(const struct sk_buff *skb)
 	return proto;
 }
 
+static inline int
+cobalt_set_ce_proto(struct sk_buff *skb, __be16 proto, int offset)
+{
+	const int iphoff = offset;
+	switch (proto) {
+	case htons(ETH_P_IP):
+		offset += sizeof(struct iphdr);
+		if (!pskb_may_pull(skb, offset) ||
+		    skb_try_make_writable(skb, offset))
+			return 0;
+
+		return IP_ECN_set_ce((struct iphdr *)(skb->data + iphoff));
+
+	case htons(ETH_P_IPV6):
+		offset += sizeof(struct ipv6hdr);
+		if (!pskb_may_pull(skb, offset) ||
+		    skb_try_make_writable(skb, offset))
+			return 0;
+
+		return IP6_ECN_set_ce(skb,
+				      (struct ipv6hdr *)(skb->data + iphoff));
+
+	default:
+		return 0;
+	}
+}
+
 static int cobalt_set_ce(struct sk_buff *skb)
 {
-	int wlen = skb_network_offset(skb);
+	const int wlen = skb_network_offset(skb);
 
 	switch (cake_skb_proto(skb)) {
 	case htons(ETH_P_IP):
-		wlen += sizeof(struct iphdr);
-		if (!pskb_may_pull(skb, wlen) ||
-		    skb_try_make_writable(skb, wlen))
-			return 0;
-
-		return IP_ECN_set_ce(ip_hdr(skb));
+		return cobalt_set_ce_proto(skb, htons(ETH_P_IP), wlen);
 
 	case htons(ETH_P_IPV6):
-		wlen += sizeof(struct ipv6hdr);
-		if (!pskb_may_pull(skb, wlen) ||
-		    skb_try_make_writable(skb, wlen))
-			return 0;
+		return cobalt_set_ce_proto(skb, htons(ETH_P_IPV6), wlen);
 
-		return IP6_ECN_set_ce(skb, ipv6_hdr(skb));
+	case htons(ETH_P_PPP_SES):
+		return cobalt_set_ce_proto(skb,
+					   get_cobalt_cb(skb)->inner_proto,
+					   get_cobalt_cb(skb)->iphdr_offset);
 
 	default:
 		return 0;
@@ -1661,13 +1686,76 @@ static unsigned int cake_drop(struct Qdisc *sch, struct sk_buff **to_free)
 	return idx + (tin << 16);
 }
 
-static u8 cake_handle_diffserv(struct sk_buff *skb, u16 wash)
+static inline bool __attribute__((hot, always_inline))
+cake_possibly_iphdr(const u8 *data)
 {
-	const int offset = skb_network_offset(skb);
+	return (data[0] & 0xf0) == 0x40;
+}
+
+static inline bool __attribute__((hot, always_inline))
+cake_possibly_ip6hdr(const u8 *data)
+{
+	return (data[0] & 0xf0) == 0x60;
+}
+
+static inline bool __attribute__((hot, always_inline))
+cake_possibly_compressed_ppp_ip(const u8 *p)
+{
+	return !(*(p + 0) == 0x00 && *(p + 1) == PPP_IP) &&
+		 *(p + 0) == PPP_IP;
+}
+
+static inline bool __attribute__((hot, always_inline))
+cake_possibly_compressed_ppp_ip6(const u8 *p)
+{
+	return !(*(p + 0) == 0x00 && *(p + 1) == PPP_IPV6) &&
+		 *(p + 0) == PPP_IPV6;
+}
+
+static inline bool __attribute__((hot, always_inline))
+cake_skip_compressed_ppp(const u8 *p, u16 *offset, u16 *proto)
+{
+	bool retval = false;
+	u16 off = *offset;
+
+	if (!(*(p + 0) == PPP_ALLSTATIONS &&
+		  *(p + 1) == PPP_UI)) {
+			/* This ppp header doesn't contain PPP_ALLSTATIONS + PPP_UI fields
+			 * due to A/C compression */
+			off -= 2;
+		} else
+			p += 2;
+
+	if (cake_possibly_compressed_ppp_ip(p) ||
+	    cake_possibly_compressed_ppp_ip6(p))
+		/* This ppp header has compressed protocol field */
+		off -= 1;
+	else
+		p += 1;
+
+	if ((*p == PPP_IP) && cake_possibly_iphdr(p + 1)) {
+		*proto = htons(ETH_P_IP);
+		retval = true;
+	} else
+	if ((*p == PPP_IPV6) && cake_possibly_ip6hdr(p + 1)) {
+		*proto = htons(ETH_P_IPV6);
+		retval = true;
+	}
+
+	if (retval)
+		*offset = off;
+
+	return retval;
+}
+
+static inline u8 cake_handle_diffserv_proto(struct sk_buff *skb,
+					    u16 wash, __be16 proto,
+					    int offset)
+{
 	u8 dscp;
 	u16 *buf, buf_;
 
-	switch (cake_skb_proto(skb)) {
+	switch (proto) {
 	case htons(ETH_P_IP):
 		buf = skb_header_pointer(skb, offset, sizeof(buf_), &buf_);
 
@@ -1709,6 +1797,53 @@ static u8 cake_handle_diffserv(struct sk_buff *skb, u16 wash)
 		}
 
 		return dscp;
+
+	default:
+
+		return 0;
+	}
+}
+
+static u8 cake_handle_diffserv(struct sk_buff *skb, u16 wash)
+{
+	const int offset = skb_network_offset(skb);
+	u16 ppphdr = 4; /* PPP addr + PPP proto */
+	u8 *pppbuf, pppbuf_[6 + 4 + 1]; /* PPPoE + PPP addr/proto + 1 from IP hdr */
+	__be16 inner_proto;
+
+	switch (cake_skb_proto(skb)) {
+	case htons(ETH_P_IP):
+		return cake_handle_diffserv_proto(skb, wash,
+						  htons(ETH_P_IP), offset);
+
+	case htons(ETH_P_IPV6):
+		return cake_handle_diffserv_proto(skb, wash,
+						  htons(ETH_P_IPV6), offset);
+
+	case htons(ETH_P_PPP_SES):
+		pppbuf = skb_header_pointer(skb, offset,
+					    sizeof(pppbuf_), &pppbuf_);
+
+		if (!pppbuf)
+			return 0;
+
+		if (!cake_skip_compressed_ppp(pppbuf + 6,
+					      &ppphdr, &inner_proto)) {
+			if (ntohs(*(__be16 *)(pppbuf + 6)) == PPP_LCP)
+				return 0x38;  /* CS7 - Net Control */
+
+			return 0;
+		}
+
+		get_cobalt_cb(skb)->inner_proto = inner_proto;
+		get_cobalt_cb(skb)->iphdr_offset = offset + 6 + ppphdr;
+
+		return cake_handle_diffserv_proto(skb, wash,
+						  get_cobalt_cb(skb)->inner_proto,
+						  get_cobalt_cb(skb)->iphdr_offset);
+
+	case htons(ETH_P_PPP_DISC):
+		return 0x38;  /* CS7 - Net Control */
 
 	case htons(ETH_P_ARP):
 		return 0x38;  /* CS7 - Net Control */
